@@ -73,16 +73,13 @@ function discoverRepos(): Repo[] {
 }
 
 class RepoItem extends vscode.TreeItem {
-  constructor(public readonly repo: Repo, hidden: boolean) {
+  constructor(public readonly repo: Repo, focused: boolean) {
     super(repo.label, vscode.TreeItemCollapsibleState.None);
     this.id = `${repo.folder.uri.fsPath}::${repo.relPath}`;
     this.resourceUri = vscode.Uri.file(repo.absPath);
-    this.iconPath = new vscode.ThemeIcon('repo');
-    this.description = hidden ? 'hidden' : undefined;
+    this.iconPath = new vscode.ThemeIcon(focused ? 'eye' : 'eye-closed');
+    this.description = focused ? undefined : 'hidden';
     this.tooltip = repo.absPath;
-    this.checkboxState = hidden
-      ? vscode.TreeItemCheckboxState.Unchecked
-      : vscode.TreeItemCheckboxState.Checked;
   }
 }
 
@@ -109,7 +106,7 @@ class RepoProvider implements vscode.TreeDataProvider<RepoItem> {
     if (this.repos.length === 0) {
       this.repos = discoverRepos();
     }
-    return this.repos.map((r) => new RepoItem(r, isHidden(r)));
+    return this.repos.map((r) => new RepoItem(r, !isHidden(r)));
   }
 }
 
@@ -166,33 +163,64 @@ async function setAllHidden(repos: Repo[], hidden: boolean): Promise<void> {
   }
 }
 
+/**
+ * Make exactly `focused` visible and every other known repo hidden,
+ * writing one update per workspace folder. `allRepos` is the full set so
+ * we know which repos to exclude.
+ */
+async function focusExactly(focused: Repo[], allRepos: Repo[]): Promise<void> {
+  const focusedIds = new Set(focused.map((r) => `${r.folder.uri.toString()}::${r.relPath}`));
+  const byFolder = new Map<string, Repo[]>();
+  for (const r of allRepos) {
+    const key = r.folder.uri.toString();
+    (byFolder.get(key) ?? byFolder.set(key, []).get(key)!).push(r);
+  }
+  for (const group of byFolder.values()) {
+    const folder = group[0].folder;
+    const cfg = vscode.workspace.getConfiguration('files', folder.uri);
+    const map = { ...(cfg.get<Record<string, boolean>>('exclude') ?? {}) };
+    for (const r of group) {
+      const id = `${r.folder.uri.toString()}::${r.relPath}`;
+      if (focusedIds.has(id)) {
+        delete map[r.relPath];
+      } else {
+        map[r.relPath] = true;
+      }
+    }
+    try {
+      await cfg.update(EXCLUDE_KEY, map, excludeTarget());
+    } catch (err) {
+      vscode.window.showErrorMessage(
+        `Explorer Focus: could not update files.exclude: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
+  }
+}
+
 export function activate(context: vscode.ExtensionContext) {
   const provider = new RepoProvider();
   const view = vscode.window.createTreeView('explorerFocus.repos', {
     treeDataProvider: provider,
-    manageCheckboxStateManually: true,
+    canSelectMany: true,
   });
 
   provider.refresh();
 
+  // Start every session with all repos visible, so a stale selection from a
+  // previous session never leaves repos hidden out of sync with the view.
+  void setAllHidden(provider.getRepos(), false).then(() => provider.refresh());
+
   context.subscriptions.push(
     view,
-    view.onDidChangeCheckboxState(async (e) => {
-      const toHide: Repo[] = [];
-      const toShow: Repo[] = [];
-      for (const [item, state] of e.items) {
-        if (state === vscode.TreeItemCheckboxState.Unchecked) {
-          toHide.push(item.repo);
-        } else {
-          toShow.push(item.repo);
-        }
+    view.onDidChangeSelection(async (e) => {
+      // Empty selection (clicked empty space) keeps the last focus untouched.
+      if (e.selection.length === 0) {
+        return;
       }
-      if (toHide.length) {
-        await setAllHidden(toHide, true);
-      }
-      if (toShow.length) {
-        await setAllHidden(toShow, false);
-      }
+      const focused = e.selection.map((item) => item.repo);
+      await focusExactly(focused, provider.getRepos());
       provider.refresh();
     }),
     vscode.commands.registerCommand('explorerFocus.refresh', () =>
