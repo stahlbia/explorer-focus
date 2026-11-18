@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
-import * as fs from 'fs';
 import * as path from 'path';
+import type { API as GitAPI, GitExtension } from './git';
 
 const EXCLUDE_KEY = 'exclude';
 
@@ -19,54 +19,42 @@ function toPosix(p: string): string {
   return p.split(path.sep).join('/');
 }
 
-/** Recursively find git repos under a directory, up to maxDepth levels deep. */
-function findRepos(root: string, maxDepth: number): string[] {
-  const found: string[] = [];
-  const walk = (dir: string, depth: number) => {
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    if (entries.some((e) => e.name === '.git')) {
-      found.push(dir);
-      return; // don't descend into a repo looking for nested repos
-    }
-    if (depth >= maxDepth) {
-      return;
-    }
-    for (const e of entries) {
-      if (e.isDirectory() && !e.name.startsWith('.') && e.name !== 'node_modules') {
-        walk(path.join(dir, e.name), depth + 1);
-      }
-    }
-  };
-  walk(root, 0);
-  return found;
+/** Resolve the built-in Git extension API, activating it if needed. */
+async function getGitAPI(): Promise<GitAPI | undefined> {
+  const ext = vscode.extensions.getExtension<GitExtension>('vscode.git');
+  if (!ext) {
+    return undefined;
+  }
+  const exports = ext.isActive ? ext.exports : await ext.activate();
+  if (!exports.enabled) {
+    return undefined;
+  }
+  return exports.getAPI(1);
 }
 
-function discoverRepos(): Repo[] {
-  const folders = vscode.workspace.workspaceFolders ?? [];
-  const depth = vscode.workspace
-    .getConfiguration('explorerFocus')
-    .get<number>('scanDepth', 2);
+/** Build Repo entries from the git API's known repositories. */
+function reposFromGit(api: GitAPI): Repo[] {
   const repos: Repo[] = [];
-  for (const folder of folders) {
-    const root = folder.uri.fsPath;
-    for (const abs of findRepos(root, depth)) {
-      const rel = toPosix(path.relative(root, abs));
-      if (rel === '') {
-        // The workspace folder itself is a repo — can't exclude its own root.
-        continue;
-      }
-      repos.push({
-        absPath: abs,
-        folder,
-        relPath: rel,
-        label: rel,
-      });
+  for (const r of api.repositories) {
+    const folder = vscode.workspace.getWorkspaceFolder(r.rootUri);
+    if (!folder) {
+      // Repo lives outside any open workspace folder — we can't scope a
+      // files.exclude entry to it, so skip it.
+      continue;
     }
+    const abs = r.rootUri.fsPath;
+    const rel = toPosix(path.relative(folder.uri.fsPath, abs));
+    if (rel === '' || rel.startsWith('..')) {
+      // The workspace folder itself is the repo root (can't exclude its own
+      // root), or the repo is not actually under the folder.
+      continue;
+    }
+    repos.push({
+      absPath: abs,
+      folder,
+      relPath: rel,
+      label: rel,
+    });
   }
   repos.sort((a, b) => a.relPath.localeCompare(b.relPath));
   return repos;
@@ -89,8 +77,15 @@ class RepoProvider implements vscode.TreeDataProvider<RepoItem> {
 
   private repos: Repo[] = [];
 
+  constructor(private api: GitAPI | undefined) {}
+
+  setApi(api: GitAPI | undefined): void {
+    this.api = api;
+    this.refresh();
+  }
+
   refresh(): void {
-    this.repos = discoverRepos();
+    this.repos = this.api ? reposFromGit(this.api) : [];
     this._onDidChange.fire();
   }
 
@@ -103,9 +98,6 @@ class RepoProvider implements vscode.TreeDataProvider<RepoItem> {
   }
 
   getChildren(): RepoItem[] {
-    if (this.repos.length === 0) {
-      this.repos = discoverRepos();
-    }
     return this.repos.map((r) => new RepoItem(r, !isHidden(r)));
   }
 }
@@ -200,17 +192,11 @@ async function focusExactly(focused: Repo[], allRepos: Repo[]): Promise<void> {
 }
 
 export function activate(context: vscode.ExtensionContext) {
-  const provider = new RepoProvider();
+  const provider = new RepoProvider(undefined);
   const view = vscode.window.createTreeView('explorerFocus.repos', {
     treeDataProvider: provider,
     canSelectMany: true,
   });
-
-  provider.refresh();
-
-  // Start every session with all repos visible, so a stale selection from a
-  // previous session never leaves repos hidden out of sync with the view.
-  void setAllHidden(provider.getRepos(), false).then(() => provider.refresh());
 
   context.subscriptions.push(
     view,
@@ -236,14 +222,29 @@ export function activate(context: vscode.ExtensionContext) {
     }),
     vscode.workspace.onDidChangeWorkspaceFolders(() => provider.refresh()),
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (
-        e.affectsConfiguration('files.exclude') ||
-        e.affectsConfiguration('explorerFocus.scanDepth')
-      ) {
+      if (e.affectsConfiguration('files.exclude')) {
         provider.refresh();
       }
     })
   );
+
+  // Load the git API asynchronously, then wire repo open/close events.
+  void getGitAPI().then((api) => {
+    provider.setApi(api);
+    if (!api) {
+      vscode.window.showWarningMessage(
+        'Explorer Focus: the built-in Git extension is not available, so no repositories can be listed.'
+      );
+      return;
+    }
+    context.subscriptions.push(
+      api.onDidOpenRepository(() => provider.refresh()),
+      api.onDidCloseRepository(() => provider.refresh())
+    );
+    // Start every session with all repos visible, so a stale selection from a
+    // previous session never leaves repos hidden out of sync with the view.
+    void setAllHidden(provider.getRepos(), false).then(() => provider.refresh());
+  });
 }
 
 export function deactivate() {}
