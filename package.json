@@ -1,10 +1,14 @@
 {
-  "name": "explorer-focus",
-  "displayName": "Explorer Focus",
-  "description": "A checkbox list in the Explorer to show/hide each git repository in a multi-repo workspace.",
+  "name": "explorer-focus-repos",
+  "displayName": "Explorer Focus - Repos",
+  "description": "Select which git repositories stay visible in the Explorer in a multi-repo workspace, hiding the rest.",
   "version": "0.1.0",
-  "publisher": "i585108",
+  "publisher": "stahlb",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/stahlbia/explorer-focus.git"
+  },
   "engines": {
     "vscode": "^1.90.0"
   },
